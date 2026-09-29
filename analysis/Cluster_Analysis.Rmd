@@ -1,0 +1,309 @@
+---
+title: "Cluster Analysis - Loyalty Program"
+output: pdf_document
+date: "2026-04-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(cluster)
+```
+
+
+```{r}
+customers <- read_excel("Loyalty Program Data.xlsx", sheet = "customers")
+purchase_records <- read_excel("Loyalty Program Data.xlsx", sheet = "purchase records")
+redeem_records <- read_excel("Loyalty Program Data.xlsx", sheet = "redeem records")
+```
+
+```{r}
+purchase_records$SalesDate <- as.POSIXct(purchase_records$SalesDate, format = "%d/%m/%Y %H:%M")
+redeem_records$RedeemDate <- as.POSIXct(redeem_records$RedeemDate, format = "%Y/%m/%d %H:%M")
+```
+
+```{r}
+customer_summary <- purchase_records %>%
+  group_by(MemberID) %>%
+  summarise(
+    Total_Purchases = n(),
+    Total_Spent = sum(SalesAmt, na.rm = TRUE),
+    Unique_Merchants = n_distinct(SalesFirm),
+    First_Purchase = min(SalesDate),
+    Last_Purchase = max(SalesDate),
+    Days_Active = as.numeric(difftime(Last_Purchase, First_Purchase, units = "days")),
+    .groups = "drop"
+  )
+
+customer_redemption <- redeem_records %>%
+  group_by(MemberID) %>%
+  summarise(
+    Total_Redemptions = n(),
+    Total_Points_Redeemed = sum(RedeemPoint, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+customer_full <- customers %>%
+  left_join(customer_summary, by = "MemberID") %>%
+  left_join(customer_redemption, by = "MemberID") %>%
+  mutate(
+    Total_Purchases = coalesce(Total_Purchases, 0),
+    Total_Spent = coalesce(Total_Spent, 0),
+    Unique_Merchants = coalesce(Unique_Merchants, 0),
+    Days_Active = coalesce(Days_Active, 0),
+    Total_Redemptions = coalesce(Total_Redemptions, 0),
+    Total_Points_Redeemed = coalesce(Total_Points_Redeemed, 0)
+  )
+```
+
+```{r}
+merchant_spend <- purchase_records %>%
+  group_by(MemberID, SalesFirm) %>%
+  summarise(
+    Spend = sum(SalesAmt, na.rm = TRUE),
+    Purchases = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = SalesFirm,
+    values_from = c(Spend, Purchases),
+    values_fill = 0
+  )
+```
+
+```{r}
+cluster_data <- customer_full %>%
+  select(
+    MemberID,
+    Total_Purchases,
+    Total_Spent,
+    Unique_Merchants,
+    Days_Active,
+    Total_Redemptions,
+    Total_Points_Redeemed
+  ) %>%
+  mutate(
+    Avg_Transaction = ifelse(Total_Purchases > 0, Total_Spent / Total_Purchases, 0)
+  ) %>%
+  left_join(merchant_spend, by = "MemberID") %>%
+  mutate(
+    Spend_FastFood = coalesce(Spend_FastFood, 0),
+    Spend_Grocery = coalesce(Spend_Grocery, 0),
+    Spend_Petrol = coalesce(Spend_Petrol, 0),
+    Purchases_FastFood = coalesce(Purchases_FastFood, 0),
+    Purchases_Grocery = coalesce(Purchases_Grocery, 0),
+    Purchases_Petrol = coalesce(Purchases_Petrol, 0)
+  )
+
+cluster_data[is.na(cluster_data)] <- 0
+```
+
+```{r}
+cluster_features <- cluster_data %>%
+  select(-MemberID) %>%
+  mutate(across(-Unique_Merchants, log1p))
+
+cluster_scaled <- scale(cluster_features)
+```
+
+```{r}
+wss <- numeric(10)
+
+for (k in 1:10) {
+  set.seed(123)
+  wss[k] <- kmeans(cluster_scaled, centers = k, nstart = 25)$tot.withinss
+}
+
+plot(
+  1:10, wss,
+  type = "b", pch = 19,
+  xlab = "Number of Clusters (k)",
+  ylab = "Total Within-Cluster Sum of Squares",
+  main = "Elbow Method for Choosing k"
+)
+```
+
+```{r}
+set.seed(123)
+k3 <- kmeans(cluster_scaled, centers = 3, nstart = 25)
+
+cluster_assignments <- cluster_data %>%
+  select(MemberID) %>%
+  mutate(Cluster = as.factor(k3$cluster))
+```
+
+```{r}
+customer_clusters <- customer_full %>%
+  left_join(cluster_assignments, by = "MemberID") %>%
+  left_join(
+    cluster_data %>%
+      select(
+        MemberID,
+        Spend_FastFood,
+        Spend_Grocery,
+        Spend_Petrol,
+        Purchases_FastFood,
+        Purchases_Grocery,
+        Purchases_Petrol
+      ),
+    by = "MemberID"
+  ) %>%
+  mutate(
+    Churned = ifelse(Active2018 == "Y" & Active2019 == "N", 1, 0),
+    Age = 2019 - BirthYear
+  )
+```
+
+```{r}
+cluster_profile <- customer_clusters %>%
+  group_by(Cluster) %>%
+  summarise(
+    Customers = n(),
+    Avg_Total_Spent = mean(Total_Spent, na.rm = TRUE),
+    Avg_Purchases = mean(Total_Purchases, na.rm = TRUE),
+    Avg_Unique_Merchants = mean(Unique_Merchants, na.rm = TRUE),
+    Avg_Days_Active = mean(Days_Active, na.rm = TRUE),
+    Avg_Redemptions = mean(Total_Redemptions, na.rm = TRUE),
+    Churn_Rate = mean(Churned, na.rm = TRUE),
+    Avg_Sat_Program = mean(Sat_Program, na.rm = TRUE),
+    Avg_NPS = mean(NetPromoter, na.rm = TRUE),
+    Avg_Age = mean(Age, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+cluster_profile_table <- cluster_profile %>%
+  mutate(
+    Segment = case_when(
+      Cluster == "1" ~ "Low-Engagement At-Risk",
+      Cluster == "2" ~ "Moderate-Value Single-Merchant",
+      Cluster == "3" ~ "High-Value Multi-Merchant Loyal",
+      TRUE ~ as.character(Cluster)
+    ),
+    Avg_Total_Spent = round(Avg_Total_Spent, 2),
+    Avg_Purchases = round(Avg_Purchases, 2),
+    Avg_Unique_Merchants = round(Avg_Unique_Merchants, 2),
+    Avg_Days_Active = round(Avg_Days_Active, 2),
+    Avg_Redemptions = round(Avg_Redemptions, 2),
+    Churn_Rate = paste0(round(Churn_Rate * 100, 1), "%"),
+    Avg_Sat_Program = round(Avg_Sat_Program, 2),
+    Avg_NPS = round(Avg_NPS, 2),
+    Avg_Age = round(Avg_Age, 2)
+  ) %>%
+  select(
+    Cluster,
+    Segment,
+    Customers,
+    Avg_Total_Spent,
+    Avg_Purchases,
+    Avg_Unique_Merchants,
+    Avg_Days_Active,
+    Avg_Redemptions,
+    Churn_Rate,
+    Avg_Sat_Program,
+    Avg_NPS,
+    Avg_Age
+  )
+
+kable(cluster_profile_table, caption = "Cluster Profile Summary")
+```
+
+```{r}
+churn_summary <- customer_clusters %>%
+  group_by(Cluster) %>%
+  summarise(
+    Customers = n(),
+    Churned_Customers = sum(Churned, na.rm = TRUE),
+    Churn_Rate = mean(Churned, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Segment = case_when(
+      Cluster == "1" ~ "Low-Engagement At-Risk",
+      Cluster == "2" ~ "Moderate-Value Single-Merchant",
+      Cluster == "3" ~ "High-Value Multi-Merchant Loyal",
+      TRUE ~ as.character(Cluster)
+    ),
+    Churn_Rate = paste0(round(Churn_Rate * 100, 1), "%")
+  ) %>%
+  select(
+    Cluster,
+    Segment,
+    Customers,
+    Churned_Customers,
+    Churn_Rate
+  )
+
+kable(churn_summary, caption = "Churn Summary by Cluster")
+```
+
+```{r}
+merchant_usage_summary <- customer_clusters %>%
+  group_by(Cluster) %>%
+  summarise(
+    Avg_Unique_Merchants = mean(Unique_Merchants, na.rm = TRUE),
+    Avg_FastFood_Spend = mean(Spend_FastFood, na.rm = TRUE),
+    Avg_Grocery_Spend = mean(Spend_Grocery, na.rm = TRUE),
+    Avg_Petrol_Spend = mean(Spend_Petrol, na.rm = TRUE),
+    Avg_FastFood_Purchases = mean(Purchases_FastFood, na.rm = TRUE),
+    Avg_Grocery_Purchases = mean(Purchases_Grocery, na.rm = TRUE),
+    Avg_Petrol_Purchases = mean(Purchases_Petrol, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Segment = case_when(
+      Cluster == "1" ~ "Low-Engagement At-Risk",
+      Cluster == "2" ~ "Moderate-Value Single-Merchant",
+      Cluster == "3" ~ "High-Value Multi-Merchant Loyal",
+      TRUE ~ as.character(Cluster)
+    ),
+    Avg_Unique_Merchants = round(Avg_Unique_Merchants, 2),
+    Avg_FastFood_Spend = round(Avg_FastFood_Spend, 2),
+    Avg_Grocery_Spend = round(Avg_Grocery_Spend, 2),
+    Avg_Petrol_Spend = round(Avg_Petrol_Spend, 2),
+    Avg_FastFood_Purchases = round(Avg_FastFood_Purchases, 2),
+    Avg_Grocery_Purchases = round(Avg_Grocery_Purchases, 2),
+    Avg_Petrol_Purchases = round(Avg_Petrol_Purchases, 2)
+  ) %>%
+  select(
+    Cluster,
+    Segment,
+    Avg_Unique_Merchants,
+    Avg_FastFood_Spend,
+    Avg_Grocery_Spend,
+    Avg_Petrol_Spend,
+    Avg_FastFood_Purchases,
+    Avg_Grocery_Purchases,
+    Avg_Petrol_Purchases
+  )
+
+kable(merchant_usage_summary, caption = "Merchant Usage by Cluster")
+```
+
+```{r}
+ggplot(cluster_profile, aes(x = Cluster, y = Avg_Total_Spent)) +
+  geom_col() +
+  labs(
+    title = "Average Spend by Cluster",
+    x = "Cluster",
+    y = "Average Total Spend"
+  )
+ggplot(cluster_profile, aes(x = Cluster, y = Customers)) +
+  geom_col() +
+  labs(
+    title = "Number of Customers by Cluster",
+    x = "Cluster",
+    y = "Number of Customers"
+  )
+ggplot(cluster_profile, aes(x = Cluster, y = Churn_Rate)) +
+  geom_col() +
+  labs(
+    title = "Churn Rate by Cluster",
+    x = "Cluster",
+    y = "Churn Rate"
+  )
+```
+
